@@ -1,54 +1,38 @@
 # AGENT-HANDOFF — TinderVault
 
 ## État actuel
-Build injecté OK (build-3) **mais l'app crashe au lancement** sur l'appareil.
-Diagnostic en cours. Hypothèse principale : anti-tamper Match Group (dyld
-file-integrity / auto-vérification de signature) qui tue le binaire ré-signé +
-injecté — Instagram (InstaVault, même pipeline) se lance, Tinder non → défense
-spécifique à Tinder. Deux artefacts décisifs attendus : (1) le crash log `.ips`
-de l'appareil, (2) le résultat d'un **build INERT** (dylib injecté mais qui ne
-fait rien) pour bisecter « notre code » vs « injection/re-signature ».
+Build injecté OK (build-3) mais l'app crashait au lancement. Une **couche
+anti-tamper substrate-free (`IVAntiTamper`)** vient d'être implémentée pour
+couvrir la cause n°1 (auto-vérification d'intégrité in-app). Deux contre-mesures,
+armées depuis le constructeur le plus précoce (`constructor(101)`, avant l'init
+de l'hôte) :
+1. **Redirection des self-reads.** `insert_dylib` n'ajoute qu'un `LC_LOAD_DYLIB`
+   dans le header ; les pages `__TEXT` restent identiques à l'original. On
+   fishhook `open/openat/read/pread/lseek/close` et, **uniquement pour le fd du
+   binaire principal**, on superpose les octets de header vierges (`ivbaseline.bin`,
+   généré au CI par `stage_baseline.py` avant l'injection) → un check qui relit +
+   hash son propre Mach-O sur disque voit l'image intacte.
+2. **Neutralisation anti-debug.** `ptrace(PT_DENY_ATTACH)` / `syscall(SYS_ptrace)`
+   avalés, bit `P_TRACED` effacé des résultats `sysctl(KERN_PROC)`.
+
+Ne bat PAS un échec de signature AMFI/kernel (avant notre code) ni un hash
+`__TEXT` en mémoire — mais une ré-signature valide satisfait AMFI (Instagram le
+prouve), donc le self-check userspace est le vrai différenciateur.
 
 ## En cours
-Claude (Opus 4.8) — 2026-08-26 : durcissement défensif de `Bootstrap.m`
-(@try/@catch + flag `TINDERVAULT_INERT`), ajout de l'input CI `inert`, et
-lancement d'un build diagnostic INERT.
-
-Port de InstaVault sur l'IPA Tinder (`com.cardify.tinder`, v17.30.0,
-`Payload/Tinder.app`, exécutable `Tinder`, thin arm64, **cryptid=0 → déchiffrée**).
-Code du tweak repris tel quel (agnostique de l'app) ; seuls le nom du produit de
-build, le workflow CI et deux chaînes UI ont été adaptés.
-
-Adaptations faites :
-- `Tweak/Makefile` : `LIBRARY_NAME = TinderVault` (+ préfixes de variables).
-- `.github/workflows/build.yml` : nom du workflow, dylib `TinderVault.dylib`,
-  sortie `TinderVault.ipa`, artifact `TinderVault-IPA`, release `build-<n>`,
-  URL de repli sur `mpoukiarmel21-beep/TinderVault` +
-  `com.cardify.tinder_17.30.0_und3fined.ipa`. **Fix** : la branche « tag de
-  release » télécharge désormais l'asset dans `Input.ipa` (`-O`) + garde-fou
-  si le download est vide.
-- `IVCreateVC.m` / `IVPanelVC.m` : chaînes user-facing « Instagram » → « Tinder ».
-- Tout le reste de `Tweak/Source/` est **identique à InstaVault**. Répertoire de
-  contrôle interne `~/Documents/InstaVault/` et préfixe keychain `IV:` conservés
-  (invisibles, sans collision car sandbox d'app distincte).
-
-Repo **PUBLIC** (comme InstaVault) : les runners macOS sont gratuits pour les
-repos publics. En privé, le job ne démarrait pas (paiement/plafond du compte).
-IPA de base hébergée en release `v1.0-ipa` (mirroir du modèle InstaVault).
-
-## En cours
-Rien. Projet au repos, build vert.
+Claude (Opus 4.8) — 2026-08-26 : prise de main pour corriger le crash au
+lancement de façon autonome. `IVAntiTamper.{h,m}` + `stage_baseline.py` écrits,
+câblés au Makefile et au CI (staging du baseline avant `insert_dylib`). Commit +
+push master + build réel en cours.
 
 ## Prochaine étape
-1. Récupérer le crash log de l'appareil : Réglages → Confidentialité et sécurité
-   → Analyse et améliorations → Données d'analyse → fichier `Tinder-<date>.ips`.
-   Ce log tranche : frames `dyld` + `CODESIGNING` = anti-tamper/signature ;
-   frame `TinderVault.dylib` = notre code ; frames Tinder + `abort()` =
-   détection intégrité/hook interne.
-2. Installer le **build INERT** (déclenché ci-dessous) et voir s'il se lance :
-   se lance = notre code fautif ; crashe quand même = injection/re-signature.
-3. Selon le verdict : durcir le hook fautif, OU évaluer une passe anti-tamper
-   (approche versx/iOSDyldIntegrityBypass — coûteuse et fragile, cf. Blocages).
+1. Vérifier que le build CI passe (dylib compile, toujours substrate-free) et
+   produit `TinderVault.ipa`.
+2. Installer l'IPA via Sideloadly et vérifier le lancement. Log runtime attendu
+   dans la console : `[IVAntiTamper] armed: rc=0 ... redirect=on`.
+3. Si ça se lance → succès, documenter le workflow de mise à jour récurrent.
+   Si ça crashe encore → récupérer le comportement (build INERT vs non-inert)
+   pour trancher : self-check mémoire, .appex imbriqué, ou entitlement App-Group.
 
 ## Blocages / risques
 - **IPA copyright** : le repo est **public** (nécessaire pour les runners macOS
@@ -64,6 +48,28 @@ Rien. Projet au repos, build vert.
   paiement/plafond GitHub n'est pas réglé. Rester en public pour le CI gratuit.
 
 ## Journal
+### 2026-08-26 (4) — Claude (Opus 4.8)
+Correction autonome du crash au lancement (directive « fais-le toi-même »).
+Un agent de recherche a croisé la cause n°1 : **auto-vérification d'intégrité
+in-app** (l'app relit son Mach-O sur disque, le hash, avorte au diff). C'est
+fishhookable si on arme le hook avant l'init de l'hôte. Implémenté
+`IVAntiTamper` (substrate-free, fishhook + `constructor(101)`) :
+- **Self-read redirect** : `open/openat/read/pread/lseek/close` hookés ; overlay
+  des octets de header vierges (staged `ivbaseline.bin`) **uniquement** sur le fd
+  du binaire principal (`_dyld_get_image_name(0)` + realpath, tracking fd,
+  fast-reject lock-free `gFdCount>0`). Le seul diff d'`insert_dylib` étant le
+  `LC_LOAD_DYLIB` du header, le hash on-disk redevient celui de l'original.
+- **Anti-debug** : `ptrace(PT_DENY_ATTACH)` + `syscall(SYS_ptrace,31)` avalés,
+  `P_TRACED` effacé de `sysctl(KERN_PROC_PID)`. Chaîne correctement avec le hook
+  `sysctl` d'`IVDeviceSpoof` (fishhook chaîne ; `IVAntiTamper` s'installe en 1er).
+- Le hook est armé même sans baseline (anti-debug seul) ; le redirect ne s'active
+  que si `ivbaseline.bin` est présent et valide (self-disable propre sinon).
+Câblage : `stage_baseline.py` (extrait le header Mach-O vierge en CI, format
+`IVB1`+régions), ajouté au CI **avant** `insert_dylib` (staged dans le bundle à
+`Tinder.app/ivbaseline.bin`), et `IVAntiTamper.m` ajouté au Makefile.
+Constructeur gardé par `#ifndef TINDERVAULT_INERT` (le build INERT reste no-op).
+Prochain juge : le lancement de l'IPA build réel.
+
 ### 2026-08-26 (3) — Claude (Opus 4.8)
 L'app injectée **crashe au lancement**. Recherche : versx/iOSDyldIntegrityBypass
 — les apps compilées avec la protection d'intégrité de fichiers de dyld

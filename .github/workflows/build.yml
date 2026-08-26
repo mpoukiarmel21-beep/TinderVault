@@ -118,7 +118,7 @@ jobs:
           WORKDIR=$(mktemp -d)
           cd "$WORKDIR"
 
-          echo "[1/5] Extracting IPA..."
+          echo "[1/6] Extracting IPA..."
           unzip -q "$GITHUB_WORKSPACE/Input.ipa"
 
           APP=$(ls -d Payload/*.app | head -1)
@@ -131,25 +131,32 @@ jobs:
           fi
           echo "Binary: $BIN"
 
-          echo "[2/5] Copying dylib..."
+          echo "[2/6] Copying dylib..."
           mkdir -p "$APP/Frameworks"
           cp "$GITHUB_WORKSPACE/$DYLIB" "$APP/Frameworks/TinderVault.dylib"
 
-          echo "[3/5] Injecting load command..."
+          echo "[3/6] Staging pristine baseline (BEFORE injection)..."
+          # Capture the untampered Mach-O header so IVAntiTamper can feed it back
+          # to any in-app integrity self-check that re-reads the binary at launch.
+          # MUST run before insert_dylib mutates $BIN.
+          python3 "$GITHUB_WORKSPACE/Tweak/stage_baseline.py" "$BIN" "$APP/ivbaseline.bin"
+          ls -lh "$APP/ivbaseline.bin"
+
+          echo "[4/6] Injecting load command..."
           insert_dylib --strip-codesig --inplace "@executable_path/Frameworks/TinderVault.dylib" "$BIN"
           if ! otool -l "$BIN" | grep -q "TinderVault.dylib"; then
             echo "::error::Load command not present after insert_dylib. Aborting."
             exit 1
           fi
 
-          echo "[4/5] Re-signing ad-hoc..."
+          echo "[5/6] Re-signing ad-hoc..."
           for fw in "$APP/Frameworks/"*.dylib; do
             codesign --force --sign - "$fw"
           done
           codesign --force --sign - "$BIN"
           codesign --verify --verbose "$BIN" || { echo "::error::codesign verify failed"; exit 1; }
 
-          echo "[5/5] Creating IPA..."
+          echo "[6/6] Creating IPA..."
           zip -r -X -q "$GITHUB_WORKSPACE/TinderVault.ipa" Payload/ -x '*.DS_Store'
 
           echo "=== Done ==="
