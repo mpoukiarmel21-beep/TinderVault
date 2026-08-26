@@ -20,19 +20,20 @@ Ne bat PAS un échec de signature AMFI/kernel (avant notre code) ni un hash
 prouve), donc le self-check userspace est le vrai différenciateur.
 
 ## En cours
-Claude (Opus 4.8) — 2026-08-26 : prise de main pour corriger le crash au
-lancement de façon autonome. `IVAntiTamper.{h,m}` + `stage_baseline.py` écrits,
-câblés au Makefile et au CI (staging du baseline avant `insert_dylib`). Commit +
-push master + build réel en cours.
+Rien. `IVAntiTamper` implémenté, câblé, compilé et injecté : **build-6 vert**
+(dylib substrate-free, baseline 64K staged, load command injecté, IPA 241M).
+IPA prête : https://github.com/mpoukiarmel21-beep/TinderVault/releases/download/build-6/TinderVault.ipa
 
 ## Prochaine étape
-1. Vérifier que le build CI passe (dylib compile, toujours substrate-free) et
-   produit `TinderVault.ipa`.
-2. Installer l'IPA via Sideloadly et vérifier le lancement. Log runtime attendu
-   dans la console : `[IVAntiTamper] armed: rc=0 ... redirect=on`.
-3. Si ça se lance → succès, documenter le workflow de mise à jour récurrent.
-   Si ça crashe encore → récupérer le comportement (build INERT vs non-inert)
-   pour trancher : self-check mémoire, .appex imbriqué, ou entitlement App-Group.
+1. **Installer build-6 via Sideloadly** et lancer Tinder. Attendu : l'app se
+   lance (le self-check d'intégrité voit le header vierge). Log console si branché :
+   `[IVAntiTamper] armed: rc=0 ... redirect=on`.
+2. Si ça se lance → succès ; documenter le workflow de mise à jour récurrent.
+   Si ça crashe encore → la cause n'est pas (ou pas seulement) le self-check
+   par read/pread. Pistes suivantes : check via `mmap` (non intercepté), hash
+   `__TEXT` en mémoire, `.appex` imbriqué à re-signer, ou entitlement App-Group.
+   Trancher avec un build INERT (`-f inert=true`) : se lance = notre code ;
+   crashe = injection/re-signature/entitlement.
 
 ## Blocages / risques
 - **IPA copyright** : le repo est **public** (nécessaire pour les runners macOS
@@ -68,7 +69,10 @@ Câblage : `stage_baseline.py` (extrait le header Mach-O vierge en CI, format
 `IVB1`+régions), ajouté au CI **avant** `insert_dylib` (staged dans le bundle à
 `Tinder.app/ivbaseline.bin`), et `IVAntiTamper.m` ajouté au Makefile.
 Constructeur gardé par `#ifndef TINDERVAULT_INERT` (le build INERT reste no-op).
-Prochain juge : le lancement de l'IPA build réel.
+Résultat : 1er build a cassé (`@implementation` manquant, corrigé), puis
+**build-6 vert** — dylib substrate-free, `staged 65536 bytes (ncmds=163
+sizeofcmds=17152)`, load command injecté, IPA 241M en release. Prochain juge :
+le lancement sur appareil.
 
 ### 2026-08-26 (3) — Claude (Opus 4.8)
 L'app injectée **crashe au lancement**. Recherche : versx/iOSDyldIntegrityBypass
