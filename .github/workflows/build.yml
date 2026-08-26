@@ -83,8 +83,14 @@ jobs:
             curl -L -o Input.ipa "$IPA_URL" --connect-timeout 30 --max-time 600
           else
             echo "Trying GitHub release tag: $IPA_URL"
-            gh release download "$IPA_URL" --pattern "*.ipa" -D . 2>/dev/null \
+            # -O writes the single matching asset straight to Input.ipa (a bare
+            # -D . would keep the asset's own name and break the later steps).
+            gh release download "$IPA_URL" --pattern "*.ipa" -O Input.ipa 2>/dev/null \
               || curl -L -o Input.ipa "https://github.com/mpoukiarmel21-beep/TinderVault/releases/download/$IPA_URL/com.cardify.tinder_17.30.0_und3fined.ipa" --connect-timeout 30 --max-time 600
+          fi
+          if [ ! -s Input.ipa ]; then
+            echo "::error::Input.ipa missing or empty after download (ipa_url=$IPA_URL)."
+            exit 1
           fi
           file Input.ipa
           ls -lh Input.ipa
