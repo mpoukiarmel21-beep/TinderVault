@@ -1,10 +1,18 @@
 # AGENT-HANDOFF — TinderVault
 
 ## État actuel
-Projet **opérationnel**. Premier build CI réussi : `TinderVault.ipa` (253 Mo,
-dylib injecté + signé ad-hoc) publié en release **build-3**.
-Télécharger : https://github.com/mpoukiarmel21-beep/TinderVault/releases/download/build-3/TinderVault.ipa
-→ installer via **Sideloadly**.
+Build injecté OK (build-3) **mais l'app crashe au lancement** sur l'appareil.
+Diagnostic en cours. Hypothèse principale : anti-tamper Match Group (dyld
+file-integrity / auto-vérification de signature) qui tue le binaire ré-signé +
+injecté — Instagram (InstaVault, même pipeline) se lance, Tinder non → défense
+spécifique à Tinder. Deux artefacts décisifs attendus : (1) le crash log `.ips`
+de l'appareil, (2) le résultat d'un **build INERT** (dylib injecté mais qui ne
+fait rien) pour bisecter « notre code » vs « injection/re-signature ».
+
+## En cours
+Claude (Opus 4.8) — 2026-08-26 : durcissement défensif de `Bootstrap.m`
+(@try/@catch + flag `TINDERVAULT_INERT`), ajout de l'input CI `inert`, et
+lancement d'un build diagnostic INERT.
 
 Port de InstaVault sur l'IPA Tinder (`com.cardify.tinder`, v17.30.0,
 `Payload/Tinder.app`, exécutable `Tinder`, thin arm64, **cryptid=0 → déchiffrée**).
@@ -32,9 +40,15 @@ IPA de base hébergée en release `v1.0-ipa` (mirroir du modèle InstaVault).
 Rien. Projet au repos, build vert.
 
 ## Prochaine étape
-Mise à jour d'une nouvelle version Tinder : uploader la nouvelle IPA **déchiffrée**
-en asset de release (ex. `v1.1-ipa`), puis `gh workflow run build.yml -f ipa_url=v1.1-ipa`.
-Le code du tweak ne change pas.
+1. Récupérer le crash log de l'appareil : Réglages → Confidentialité et sécurité
+   → Analyse et améliorations → Données d'analyse → fichier `Tinder-<date>.ips`.
+   Ce log tranche : frames `dyld` + `CODESIGNING` = anti-tamper/signature ;
+   frame `TinderVault.dylib` = notre code ; frames Tinder + `abort()` =
+   détection intégrité/hook interne.
+2. Installer le **build INERT** (déclenché ci-dessous) et voir s'il se lance :
+   se lance = notre code fautif ; crashe quand même = injection/re-signature.
+3. Selon le verdict : durcir le hook fautif, OU évaluer une passe anti-tamper
+   (approche versx/iOSDyldIntegrityBypass — coûteuse et fragile, cf. Blocages).
 
 ## Blocages / risques
 - **IPA copyright** : le repo est **public** (nécessaire pour les runners macOS
@@ -50,6 +64,21 @@ Le code du tweak ne change pas.
   paiement/plafond GitHub n'est pas réglé. Rester en public pour le CI gratuit.
 
 ## Journal
+### 2026-08-26 (3) — Claude (Opus 4.8)
+L'app injectée **crashe au lancement**. Recherche : versx/iOSDyldIntegrityBypass
+— les apps compilées avec la protection d'intégrité de fichiers de dyld
+crashent au lancement quand le binaire est déchiffré/ré-signé (dyld relit les
+4 premières pages = header + load commands, puis le blob de signature, et
+`CrashIfInvalidCodeSignature()` avorte si ça ne matche pas). Ajout d'un LC_LOAD_DYLIB
++ re-signature ad-hoc = exactement ce que ce contrôle détecte. Match Group
+(Tinder) est réputé pour cet anti-tamper ; Instagram (même pipeline) se lance,
+donc c'est spécifique à Tinder. Actions : (1) durci `Bootstrap.m` — corps extrait
+dans `IVBootstrapRun()`, wrap `@try/@catch` pour qu'aucune exception ObjC ne
+tue l'hôte ; (2) flag compile `TINDERVAULT_INERT` (Makefile `TV_INERT=1`) qui
+rend le constructeur no-op ; (3) input CI booléen `inert`. Lancé un build INERT
+pour bisecter. Prochain juge : le crash log `.ips` + le comportement du build
+INERT.
+
 ### 2026-08-26 (2) — Claude (Opus 4.8)
 Repo créé en privé → le premier build a échoué au démarrage du job (paiement du
 compte / plafond : les minutes macOS des repos privés sont facturées). InstaVault

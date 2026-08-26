@@ -43,4 +43,11 @@ TinderVault_CFLAGS = -fobjc-arc \
 
 TinderVault_FRAMEWORKS = UIKit CoreLocation MapKit Security
 
+# Diagnostic: `make TV_INERT=1` builds an inert dylib (injected + loaded but no
+# hooks) to isolate a launch crash. CI exposes this as the `inert` workflow
+# input. See the TINDERVAULT_INERT guard in Source/Bootstrap.m.
+ifeq ($(TV_INERT),1)
+TinderVault_CFLAGS += -DTINDERVAULT_INERT=1
+endif
+
 include $(THEOS_MAKE_PATH)/library.mk

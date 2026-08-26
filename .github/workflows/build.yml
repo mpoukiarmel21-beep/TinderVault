@@ -7,6 +7,11 @@ on:
         description: 'Release tag (e.g. v1.0-ipa), direct URL, or Gofile folder code'
         required: true
         type: string
+      inert:
+        description: 'Diagnostic: build an inert dylib (no hooks) to isolate a launch crash'
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: write
@@ -45,7 +50,12 @@ jobs:
         run: |
           export PATH="$THEOS/bin:$PATH"
           cd Tweak
-          make clean all
+          if [ "${{ inputs.inert }}" = "true" ]; then
+            echo "=== INERT diagnostic build (no hooks) ==="
+            make TV_INERT=1 clean all
+          else
+            make clean all
+          fi
           echo "=== Built files ==="
           find .theos/obj -name "*.dylib" -type f
           DYLIB=$(find .theos/obj -name "*.dylib" -type f | head -1)
