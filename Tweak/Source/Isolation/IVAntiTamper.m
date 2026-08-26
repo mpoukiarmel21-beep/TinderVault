@@ -259,6 +259,8 @@ static int iv_sysctl(int *name, u_int nl, void *oldp, size_t *oldlenp, void *new
 
 #pragma mark - Install
 
+@implementation IVAntiTamper
+
 + (void)install {
     if (gInstalled) return;
     gInstalled = YES;
