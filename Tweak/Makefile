@@ -15,7 +15,6 @@ TinderVault_FILES = \
 	Source/Core/IVPaths.m \
 	Source/Core/IVContainer.m \
 	Source/Core/IVContainerStore.m \
-	Source/Isolation/IVAntiTamper.m \
 	Source/Isolation/IVHomeRedirect.m \
 	Source/Isolation/IVKeychainHook.m \
 	Source/Isolation/IVPrefsHook.m \

@@ -154,32 +154,22 @@ jobs:
             exit 1
           fi
 
-          echo "[5/6] Matching the proven TinderPlus recipe: UNSIGNED main binary..."
-          # Static Mach-O diff of the KNOWN-GOOD injected binary (TinderPlus /
-          # Blaze, Tinder 17.24) vs our 17.30 target proved: 17.30 adds NO launch
-          # hardening (same segments, flags, chained-fixups, minOS; no __RESTRICT,
-          # no new attestation LC). The proven-good artifact carries an appended
-          # LC_LOAD_DYLIB AND its main binary is left completely UNSIGNED (no
-          # LC_CODE_SIGNATURE) — Sideloadly signs authoritatively at install.
-          #
-          # Our earlier pipeline ad-hoc re-signed the 194 MB main binary here.
-          # That was the ONLY packaging step diverging from the proven recipe, and
-          # the INERT build (both constructors no-op) still crashed at launch —
-          # i.e. the fault is in the load/sign mechanics, not our code. So we drop
-          # the main-binary re-sign entirely and ship it unsigned, exactly like
-          # TinderPlus. insert_dylib --strip-codesig already removed the signature;
-          # Apple's codesign --remove-signature guarantees it (belt & suspenders).
-          # The dylib alone gets a clean ad-hoc sig so it is structurally valid
-          # going in; Sideloadly deep-signs Frameworks/ at install.
-          codesign --remove-signature "$BIN" 2>/dev/null || true
-          codesign --remove-signature "$APP/Frameworks/TinderVault.dylib" 2>/dev/null || true
-          codesign --force --sign - "$APP/Frameworks/TinderVault.dylib"
-          codesign --verify --verbose "$APP/Frameworks/TinderVault.dylib" || { echo "::error::dylib codesign verify failed"; exit 1; }
-          if otool -l "$BIN" | grep -q LC_CODE_SIGNATURE; then
-            echo "::error::main binary still has LC_CODE_SIGNATURE — must ship unsigned to match proven recipe"
-            exit 1
-          fi
-          echo "OK: main binary is UNSIGNED (matches TinderPlus/Blaze proven recipe); dylib ad-hoc signed"
+          echo "[5/6] Re-signing ad-hoc (proven InstaVault recipe: sign frameworks + main binary)..."
+          # WHY this exact sequence: the user's InstaVault dylib LAUNCHES on
+          # Instagram through this identical pipeline — ad-hoc sign every
+          # Frameworks/*.dylib, then ad-hoc sign the main binary, then verify.
+          # Our earlier "ship the main binary UNSIGNED" experiment (build-10)
+          # DIVERGED from this proven recipe and still crashed, so we revert to
+          # InstaVault's signing verbatim. insert_dylib --strip-codesig already
+          # stripped the App Store signature; `codesign --force` replaces whatever
+          # is there with a clean ad-hoc signature. Sideloadly then re-signs
+          # authoritatively at install (deep-signing Frameworks/).
+          for fw in "$APP/Frameworks/"*.dylib; do
+            codesign --force --sign - "$fw"
+          done
+          codesign --force --sign - "$BIN"
+          codesign --verify --verbose "$BIN" || { echo "::error::codesign verify failed"; exit 1; }
+          echo "OK: frameworks + main binary ad-hoc signed (matches proven InstaVault recipe)"
 
           echo "[6/6] Creating IPA..."
           zip -r -X -q "$GITHUB_WORKSPACE/TinderVault.ipa" Payload/ -x '*.DS_Store'
