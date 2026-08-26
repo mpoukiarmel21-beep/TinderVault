@@ -131,28 +131,42 @@ jobs:
           fi
           echo "Binary: $BIN"
 
-          echo "[2/6] Copying dylib..."
+          echo "[2/6] Stripping app extensions & nested apps (sideload hygiene)..."
+          # PlugIns/*.appex and a bundled Watch app each need their own signed
+          # app-ID + provisioning profile. On a free 7-day profile they exhaust
+          # the 3-app-ID budget, and a single stale/mismatched appex entitlement
+          # SIGKILLs the whole host at launch (0xe8008016). None are required for
+          # the core app to run, so remove them deterministically here rather
+          # than relying on Sideloadly's toggle.
+          rm -rf "$APP/PlugIns" "$APP/Watch" "$APP/com.apple.WatchPlaceholder"
+          echo "Top-level app dirs after strip:"; ls -1 "$APP" | head -40
+
+          echo "[3/6] Copying dylib into the bundle (Sideloadly deep-signs it)..."
           mkdir -p "$APP/Frameworks"
           cp "$GITHUB_WORKSPACE/$DYLIB" "$APP/Frameworks/TinderVault.dylib"
 
-          echo "[3/6] Staging pristine baseline (BEFORE injection)..."
-          # Capture the untampered Mach-O header so IVAntiTamper can feed it back
-          # to any in-app integrity self-check that re-reads the binary at launch.
-          # MUST run before insert_dylib mutates $BIN.
-          python3 "$GITHUB_WORKSPACE/Tweak/stage_baseline.py" "$BIN" "$APP/ivbaseline.bin"
-          ls -lh "$APP/ivbaseline.bin"
-
           echo "[4/6] Injecting load command..."
-          insert_dylib --strip-codesig --inplace "@executable_path/Frameworks/TinderVault.dylib" "$BIN"
+          # --strip-codesig removes the LC_CODE_SIGNATURE during insertion,
+          # --all-yes suppresses the interactive prompt so CI never hangs.
+          insert_dylib --strip-codesig --all-yes --inplace "@executable_path/Frameworks/TinderVault.dylib" "$BIN"
           if ! otool -l "$BIN" | grep -q "TinderVault.dylib"; then
             echo "::error::Load command not present after insert_dylib. Aborting."
             exit 1
           fi
 
-          echo "[5/6] Re-signing ad-hoc..."
-          for fw in "$APP/Frameworks/"*.dylib; do
-            codesign --force --sign - "$fw"
-          done
+          echo "[5/6] Normalizing the code signature (single clean ad-hoc pass)..."
+          # insert_dylib mutated the Mach-O, so the original signature is invalid.
+          # Use Apple's own codesign to remove any stale/partial signature the
+          # injector may have left (more reliable than its truncation), then apply
+          # ONE well-formed ad-hoc signature. Sideloadly re-signs authoritatively
+          # at install with the real cert and deep-signs Frameworks/; this pass
+          # only guarantees the IPA is structurally valid going in. Sign the dylib
+          # first, the main binary last (it now references the signed dylib). We
+          # deliberately do NOT ad-hoc re-sign the base app's own Frameworks — they
+          # arrive validly signed and Sideloadly handles them.
+          codesign --remove-signature "$APP/Frameworks/TinderVault.dylib" 2>/dev/null || true
+          codesign --remove-signature "$BIN" 2>/dev/null || true
+          codesign --force --sign - "$APP/Frameworks/TinderVault.dylib"
           codesign --force --sign - "$BIN"
           codesign --verify --verbose "$BIN" || { echo "::error::codesign verify failed"; exit 1; }
 

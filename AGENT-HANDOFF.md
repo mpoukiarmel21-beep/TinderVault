@@ -1,45 +1,48 @@
 # AGENT-HANDOFF — TinderVault
 
 ## État actuel
-Build injecté OK (build-3) mais l'app crashait au lancement. Une **couche
-anti-tamper substrate-free (`IVAntiTamper`)** vient d'être implémentée pour
-couvrir la cause n°1 (auto-vérification d'intégrité in-app). Deux contre-mesures,
-armées depuis le constructeur le plus précoce (`constructor(101)`, avant l'init
-de l'hôte) :
-1. **Redirection des self-reads.** `insert_dylib` n'ajoute qu'un `LC_LOAD_DYLIB`
-   dans le header ; les pages `__TEXT` restent identiques à l'original. On
-   fishhook `open/openat/read/pread/lseek/close` et, **uniquement pour le fd du
-   binaire principal**, on superpose les octets de header vierges (`ivbaseline.bin`,
-   généré au CI par `stage_baseline.py` avant l'injection) → un check qui relit +
-   hash son propre Mach-O sur disque voit l'image intacte.
-2. **Neutralisation anti-debug.** `ptrace(PT_DENY_ATTACH)` / `syscall(SYS_ptrace)`
-   avalés, bit `P_TRACED` effacé des résultats `sysctl(KERN_PROC)`.
+Tinder **repris** (2026-08-26) sur un nouveau datapoint décisif de l'utilisateur :
+l'**IPA de base non modifiée** (`com.cardify.tinder_17.30.0_und3fined`, déchiffrée)
+re-signée par Sideloadly **s'installe et se lance sans crash**. Or le build INERT
+(dylib injecté + re-signé, code no-op) crashe. Les deux sont re-signés par
+Sideloadly → **le tueur n'est PAS un durcissement du binaire de base** (sinon la
+base crasherait aussi) : c'est **notre transformation de pipeline** (insert_dylib +
+strip/re-signature ad-hoc + repackage) qui introduit le crash.
 
-Ne bat PAS un échec de signature AMFI/kernel (avant notre code) ni un hash
-`__TEXT` en mémoire — mais une ré-signature valide satisfait AMFI (Instagram le
-prouve), donc le self-check userspace est le vrai différenciateur.
+Conclusion : la piste `IVAntiTamper` (redirection de self-read on-disk) visait la
+mauvaise couche — une re-signature valide satisfait déjà ce contrôle (la base le
+prouve). Correctif **côté pipeline** appliqué à `build.yml` (voir Journal 7).
 
 ## En cours
-Claude (Opus 4.8) — **bisection INERT**. build-6 (anti-tamper complet) **crashe
-toujours** au device → l'hypothèse « self-check d'intégrité » est infirmée ou
-insuffisante. On arrête de deviner. Build **INERT** produit = **build-8**
-(dylib injecté + re-signé À L'IDENTIQUE de build-6, mais les DEUX constructeurs
-sont des no-op : zéro hook, zéro anti-tamper, zéro isolation).
-IPA inert : https://github.com/mpoukiarmel21-beep/TinderVault/releases/download/build-8/TinderVault.ipa
-En attente du verdict device (crash / pas crash).
+Claude (Opus 4.8) — **correctif pipeline "solution pro"**, 2026-08-26. Édité
+`.github/workflows/build.yml` (étape *Inject & Package*) pour éliminer les
+artefacts de la couche modif/signature, les seules variables entre base-qui-marche
+et inert-qui-crashe :
+1. **Signature propre** : `insert_dylib --strip-codesig --all-yes` puis
+   `codesign --remove-signature` (outil Apple, fiable) puis **UNE** signature
+   ad-hoc bien formée (dylib d'abord, binaire principal ensuite). Fini le
+   double-sign redondant et la troncature `__LINKEDIT` hasardeuse.
+2. **Strip PlugIns/Watch** : `rm -rf PlugIns Watch com.apple.WatchPlaceholder` —
+   supprime le SIGKILL 0xe8008016 d'un `.appex` mal signé et la pression sur le
+   budget 3-app-IDs du profil gratuit.
+3. **Suppression du staging `ivbaseline.bin`** : plus de `stage_baseline.py` au
+   CI → `IVAntiTamper` voit `gRegionCount==0` et **n'arme plus** la redirection de
+   self-read (hooks `read/open/pread/...` invasifs et à risque) ; seul l'anti-debug
+   léger (ptrace/sysctl) reste. Aucune édition de source nécessaire.
+Build **non-INERT** (le vrai tweak) déclenché via `gh workflow run build.yml
+-f ipa_url=v1.0-ipa` — pari sur le WIN direct plutôt qu'un énième round INERT.
 
 ## Prochaine étape
-Interpréter le test de build-8 (même modif binaire que build-6, notre code
-désactivé) :
-1. **build-8 crashe aussi** → le crash vient de la MODIF/re-signature/entitlement
-   elle-même, PAS de notre code. La redirection de self-read ne pouvait pas
-   aider. Pivot : tester l'IPA brute non modifiée (`v1.0-ipa`) pour isoler
-   entitlement/App-Group vs. simple présence d'un dylib injecté. Puis attaquer
-   côté pipeline : entitlements (App Attest/DeviceCheck, App-Groups),
-   re-signature profonde des `.framework`/`PlugIns/*.appex`, mmap-based integrity.
-2. **build-8 se lance** → le crash vient de NOTRE code actif (un hook/ctor).
-   Bisection par module : réactiver un cran à la fois (anti-tamper seul, puis
-   spoof, puis isolation, puis UI) jusqu'à retrouver le coupable.
+1. Vérifier le run CI vert, puis **installer via Sideloadly** et tester le
+   lancement sur appareil.
+2. **Si ça se lance** → gagné : la cause était bien la mécanique de pipeline.
+   Vérifier ensuite l'isolation (containers, bouton flottant, GPS).
+3. **Si ça crashe encore** → toutes les variables mécaniques sont éliminées, donc
+   il reste la **classe B** (Tinder scanne la liste d'images / hash ses load
+   commands EN MÉMOIRE et détecte le dylib étranger). Escalade : injection sans
+   toucher le binaire principal (LiveContainer / guest non modifié), ou renommer/
+   masquer le dylib + bypass memory-check (modèle RexiRexii). NE PAS ressusciter
+   `IVAntiTamper` (mauvaise couche, verdict INERT).
 
 ## Blocages / risques
 - **IPA copyright** : le repo est **public** (nécessaire pour les runners macOS
@@ -55,6 +58,43 @@ désactivé) :
   paiement/plafond GitHub n'est pas réglé. Rester en public pour le CI gratuit.
 
 ## Journal
+### 2026-08-26 (7) — Claude (Opus 4.8)
+**Reprise Tinder + correctif pipeline "pro".** Nouveau datapoint utilisateur :
+l'IPA **de base non modifiée** (und3fined, déchiffrée) re-signée Sideloadly
+**se lance sans crash**. Puisque le build INERT (dylib injecté + re-signé, code
+no-op) crashe et que les deux passent par Sideloadly, le crash **n'est pas** un
+durcissement du binaire de base : il est **introduit par notre pipeline**. Vérifié
+que INERT est un vrai témoin neutre : les 2 seuls constructeurs (`IVBootstrap`,
+`IVAntiTamperCtor`) sont gardés `#ifndef TINDERVAULT_INERT`, et `IVContainerStore`
+n'a qu'un `-load` d'instance (pas de `+load` auto). Donc INERT ne charge que le
+dylib (registration ObjC) — d'où : la mécanique modif/signature est le suspect.
+Correctif `build.yml` (étape *Inject & Package*), qui élimine les variables entre
+base-OK et inert-KO :
+1. remplacé le double-sign ad-hoc + `--strip-codesig` seul par
+   `insert_dylib --strip-codesig --all-yes` → `codesign --remove-signature`
+   (outil Apple) → **une** signature ad-hoc propre (dylib puis binaire) ;
+2. `rm -rf PlugIns Watch com.apple.WatchPlaceholder` (hygiène sideload, anti
+   SIGKILL 0xe8008016 + budget app-IDs) ;
+3. retiré l'appel `stage_baseline.py` → plus de `ivbaseline.bin` → `IVAntiTamper`
+   n'arme plus la redirection self-read invasive (`gRegionCount==0`), seul
+   l'anti-debug léger subsiste.
+Build **non-INERT** déclenché (`-f ipa_url=v1.0-ipa`). Si ça se lance : gagné
+(cause = mécanique). Sinon : classe B (scan in-memory de la liste d'images) →
+injection sans toucher le binaire principal / LiveContainer. `IVAntiTamper`
+définitivement écarté comme fix (verdict INERT).
+
+### 2026-08-26 (6) — Claude (Opus 4.8)
+**Verdict INERT + PAUSE Tinder + pivot Threads.** Retour utilisateur : build-8
+(INERT) **crashe toujours**. Conclusion mécanique : la modif binaire + re-signature
+de build-8 étant identique à build-6 (seule différence : constructeurs no-op),
+le crash au lancement **vient de la couche modif/signature/entitlement, pas de
+notre code**. La piste anti-tamper (self-read redirect `IVAntiTamper`) visait la
+mauvaise couche. Tinder = classe durcie (App Attest + Frida/Cydia + self-hash),
+à distinguer d'Instagram/Threads (burbn/FBSDK, lenient) qui passent le même
+pipeline. Projet mis en pause sur décision utilisateur ; reprise ultérieure côté
+pipeline uniquement (entitlements minimaux, re-sign profond PlugIns/Frameworks,
+IPA déchiffrée + TrollStore). Bascule sur le projet **Threads** (D:\KIRO\ThreadsVault).
+
 ### 2026-08-26 (5) — Claude (Opus 4.8)
 build-6 (anti-tamper complet) **crashe toujours** au lancement (retour user :
 « tjrs crash »). Deux fixes hypothétiques d'affilée sans diagnostic → arrêt du
