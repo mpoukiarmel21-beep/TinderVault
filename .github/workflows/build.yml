@@ -154,21 +154,32 @@ jobs:
             exit 1
           fi
 
-          echo "[5/6] Normalizing the code signature (single clean ad-hoc pass)..."
-          # insert_dylib mutated the Mach-O, so the original signature is invalid.
-          # Use Apple's own codesign to remove any stale/partial signature the
-          # injector may have left (more reliable than its truncation), then apply
-          # ONE well-formed ad-hoc signature. Sideloadly re-signs authoritatively
-          # at install with the real cert and deep-signs Frameworks/; this pass
-          # only guarantees the IPA is structurally valid going in. Sign the dylib
-          # first, the main binary last (it now references the signed dylib). We
-          # deliberately do NOT ad-hoc re-sign the base app's own Frameworks — they
-          # arrive validly signed and Sideloadly handles them.
-          codesign --remove-signature "$APP/Frameworks/TinderVault.dylib" 2>/dev/null || true
+          echo "[5/6] Matching the proven TinderPlus recipe: UNSIGNED main binary..."
+          # Static Mach-O diff of the KNOWN-GOOD injected binary (TinderPlus /
+          # Blaze, Tinder 17.24) vs our 17.30 target proved: 17.30 adds NO launch
+          # hardening (same segments, flags, chained-fixups, minOS; no __RESTRICT,
+          # no new attestation LC). The proven-good artifact carries an appended
+          # LC_LOAD_DYLIB AND its main binary is left completely UNSIGNED (no
+          # LC_CODE_SIGNATURE) — Sideloadly signs authoritatively at install.
+          #
+          # Our earlier pipeline ad-hoc re-signed the 194 MB main binary here.
+          # That was the ONLY packaging step diverging from the proven recipe, and
+          # the INERT build (both constructors no-op) still crashed at launch —
+          # i.e. the fault is in the load/sign mechanics, not our code. So we drop
+          # the main-binary re-sign entirely and ship it unsigned, exactly like
+          # TinderPlus. insert_dylib --strip-codesig already removed the signature;
+          # Apple's codesign --remove-signature guarantees it (belt & suspenders).
+          # The dylib alone gets a clean ad-hoc sig so it is structurally valid
+          # going in; Sideloadly deep-signs Frameworks/ at install.
           codesign --remove-signature "$BIN" 2>/dev/null || true
+          codesign --remove-signature "$APP/Frameworks/TinderVault.dylib" 2>/dev/null || true
           codesign --force --sign - "$APP/Frameworks/TinderVault.dylib"
-          codesign --force --sign - "$BIN"
-          codesign --verify --verbose "$BIN" || { echo "::error::codesign verify failed"; exit 1; }
+          codesign --verify --verbose "$APP/Frameworks/TinderVault.dylib" || { echo "::error::dylib codesign verify failed"; exit 1; }
+          if otool -l "$BIN" | grep -q LC_CODE_SIGNATURE; then
+            echo "::error::main binary still has LC_CODE_SIGNATURE — must ship unsigned to match proven recipe"
+            exit 1
+          fi
+          echo "OK: main binary is UNSIGNED (matches TinderPlus/Blaze proven recipe); dylib ad-hoc signed"
 
           echo "[6/6] Creating IPA..."
           zip -r -X -q "$GITHUB_WORKSPACE/TinderVault.ipa" Payload/ -x '*.DS_Store'

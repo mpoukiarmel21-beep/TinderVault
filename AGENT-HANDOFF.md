@@ -1,48 +1,34 @@
 # AGENT-HANDOFF — TinderVault
 
 ## État actuel
-Tinder **repris** (2026-08-26) sur un nouveau datapoint décisif de l'utilisateur :
-l'**IPA de base non modifiée** (`com.cardify.tinder_17.30.0_und3fined`, déchiffrée)
-re-signée par Sideloadly **s'installe et se lance sans crash**. Or le build INERT
-(dylib injecté + re-signé, code no-op) crashe. Les deux sont re-signés par
-Sideloadly → **le tueur n'est PAS un durcissement du binaire de base** (sinon la
-base crasherait aussi) : c'est **notre transformation de pipeline** (insert_dylib +
-strip/re-signature ad-hoc + repackage) qui introduit le crash.
-
-Conclusion : la piste `IVAntiTamper` (redirection de self-read on-disk) visait la
-mauvaise couche — une re-signature valide satisfait déjà ce contrôle (la base le
-prouve). Correctif **côté pipeline** appliqué à `build.yml` (voir Journal 7).
+Tinder **repris** (2026-08-26) sur une preuve statique décisive : le binaire
+**injecté qui MARCHE** (TinderPlus/Blaze, Tinder **17.24**) et notre cible
+**17.30** sont structurellement identiques (mêmes 5 segments, pas de `__RESTRICT`,
+`flags=0xa10085`, `DYLD_CHAINED_FIXUPS`, `minOS=16.0/SDK=26.5`, `cryptid=0` des
+deux côtés). **17.30 n'ajoute AUCUN durcissement de lancement.** La seule vraie
+différence : le binaire principal 17.24 qui marche est **entièrement NON SIGNÉ**
+(strip par insert_dylib, Sideloadly signe à l'install), tandis que notre pipeline
+**re-signait ad-hoc** le binaire principal de 194 Mo. Le build INERT (ctors no-op)
+crashait quand même → le crash vient de la **mécanique de chargement/signature**,
+pas de notre code. **H-version rejetée, H-mécanique confirmée.**
 
 ## En cours
-Claude (Opus 4.8) — **correctif pipeline "solution pro"**, 2026-08-26. Édité
-`.github/workflows/build.yml` (étape *Inject & Package*) pour éliminer les
-artefacts de la couche modif/signature, les seules variables entre base-qui-marche
-et inert-qui-crashe :
-1. **Signature propre** : `insert_dylib --strip-codesig --all-yes` puis
-   `codesign --remove-signature` (outil Apple, fiable) puis **UNE** signature
-   ad-hoc bien formée (dylib d'abord, binaire principal ensuite). Fini le
-   double-sign redondant et la troncature `__LINKEDIT` hasardeuse.
-2. **Strip PlugIns/Watch** : `rm -rf PlugIns Watch com.apple.WatchPlaceholder` —
-   supprime le SIGKILL 0xe8008016 d'un `.appex` mal signé et la pression sur le
-   budget 3-app-IDs du profil gratuit.
-3. **Suppression du staging `ivbaseline.bin`** : plus de `stage_baseline.py` au
-   CI → `IVAntiTamper` voit `gRegionCount==0` et **n'arme plus** la redirection de
-   self-read (hooks `read/open/pread/...` invasifs et à risque) ; seul l'anti-debug
-   léger (ptrace/sysctl) reste. Aucune édition de source nécessaire.
-Build **non-INERT** (le vrai tweak) déclenché via `gh workflow run build.yml
--f ipa_url=v1.0-ipa` — pari sur le WIN direct plutôt qu'un énième round INERT.
+Claude (Opus 4.8) — **2026-08-26** : correctif pipeline aligné sur la recette
+prouvée TinderPlus. `build.yml` édité (étape *Inject & Package* [5/6]). Build CI
+sur la base 17.30 en cours de déclenchement.
 
 ## Prochaine étape
 1. Vérifier le run CI vert, puis **installer via Sideloadly** et tester le
-   lancement sur appareil.
-2. **Si ça se lance** → gagné : la cause était bien la mécanique de pipeline.
-   Vérifier ensuite l'isolation (containers, bouton flottant, GPS).
-3. **Si ça crashe encore** → toutes les variables mécaniques sont éliminées, donc
-   il reste la **classe B** (Tinder scanne la liste d'images / hash ses load
-   commands EN MÉMOIRE et détecte le dylib étranger). Escalade : injection sans
-   toucher le binaire principal (LiveContainer / guest non modifié), ou renommer/
-   masquer le dylib + bypass memory-check (modèle RexiRexii). NE PAS ressusciter
-   `IVAntiTamper` (mauvaise couche, verdict INERT).
+   lancement sur appareil (base 17.30, binaire principal non signé).
+2. **Si ça se lance** → H-mécanique confirmée : la cause était la re-signature
+   ad-hoc du binaire principal. Vérifier ensuite l'isolation (containers, bouton
+   flottant, GPS, spoof) et renforcer l'anti-traçage inter-conteneurs.
+3. **Si ça crashe encore** → base de repli **17.24** : dé-Blazer le binaire
+   TinderPlus (retirer le dernier LC `@rpath/BlazeUniversal.dylib` + frameworks
+   Blaze/CydiaSubstrate, chirurgie sans décalage d'offset), l'héberger comme
+   release, et builder TinderVault dessus. Si 17.24+notre-dylib marche mais pas
+   17.30, alors 17.30 est durci d'une manière invisible en statique (à investiguer
+   côté runtime/attestation). NE PAS ressusciter IVAntiTamper sans preuve.
 
 ## Blocages / risques
 - **IPA copyright** : le repo est **public** (nécessaire pour les runners macOS
@@ -58,6 +44,36 @@ Build **non-INERT** (le vrai tweak) déclenché via `gh workflow run build.yml
   paiement/plafond GitHub n'est pas réglé. Rester en public pour le CI gratuit.
 
 ## Journal
+### 2026-08-26 (8) — Claude (Opus 4.8)
+**Preuve statique : 17.30 ≈ 17.24, le crash est mécanique (signature).** Sur
+directive utilisateur (« base-toi sur l'archi TinderPlus qui marche »), parsé le
+binaire principal **injecté-qui-marche** de TinderPlus (`/tmp/macho2.py`, dumper
+pur-Python) : Tinder **17.24**, thin arm64, `@rpath/BlazeUniversal.dylib` ajouté
+en **dernier** load command (index 160), `cryptid=0`, **AUCUNE** `LC_CODE_SIGNATURE`
+(binaire NON SIGNÉ). Blaze ne porte aucun bypass d'intégrité dyld (MSHookMessageEx
++ sysctl seulement). Diff LC complet 17.24 vs 17.30 :
+- **Identiques** : 5 segments (`__PAGEZERO/__TEXT/__DATA_CONST/__DATA/__LINKEDIT`,
+  **pas de `__RESTRICT`**), `flags=0xa10085`, `DYLD_CHAINED_FIXUPS`×1,
+  `DYLD_EXPORTS_TRIE`×1, `ENCRYPTION_INFO_64`×1 `cryptid=0`, `BUILD_VERSION`
+  `minOS=16.0 SDK=26.5`, `MAIN`, `UUID`, `FUNCTION_STARTS`, `DATA_IN_CODE`.
+- **Diffs** : 17.30 a `CODE_SIGNATURE`×1 (c'est l'IPA App Store d'origine, encore
+  signée) ; 17.24 ne l'a pas (strippé) ; RPATH 2→5 ; dylibs 104→101, weak 38→39
+  (évolution appli banale). **Aucun LC de durcissement nouveau.**
+→ **H-version rejetée** : 17.30 n'ajoute aucun contrôle de lancement absent de
+17.24. La seule divergence entre la recette prouvée (TinderPlus : binaire
+principal **non signé**) et la nôtre : notre `build.yml` **re-signait ad-hoc** le
+binaire principal de 194 Mo. Combiné au fait que le build **INERT** (ctors no-op)
+crashait quand même → le crash est dans la **mécanique signature/chargement**, pas
+notre code. **Correctif** (`build.yml`, étape *Inject & Package* [5/6]) : on
+n'ad-hoc-signe plus le binaire principal ; `insert_dylib --strip-codesig` +
+`codesign --remove-signature` le laissent **non signé** (état TinderPlus prouvé),
+Sideloadly signe à l'install ; seul le **dylib** reçoit une signature ad-hoc
+propre (+ `codesign --verify` sur le dylib) ; garde-fou : abort si le binaire
+principal contient encore `LC_CODE_SIGNATURE`. Build 17.30 déclenché
+(`-f ipa_url=v1.0-ipa`). Repli documenté : base 17.24 dé-Blazée si ça crashe
+encore. `IVAntiTamper` reste écarté (aucune preuve d'un contrôle d'intégrité sur
+17.24/17.30).
+
 ### 2026-08-26 (7) — Claude (Opus 4.8)
 **Reprise Tinder + correctif pipeline "pro".** Nouveau datapoint utilisateur :
 l'IPA **de base non modifiée** (und3fined, déchiffrée) re-signée Sideloadly
