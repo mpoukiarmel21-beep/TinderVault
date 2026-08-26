@@ -34,7 +34,9 @@ static void IVScheduleFloatingButton(void) {
 }
 
 // Runs the full tweak init. Split out of the constructor so the body can be
-// wrapped in a single @try/@catch guard below.
+// wrapped in a single @try/@catch guard below. Marked `unused` because the
+// INERT diagnostic build (TINDERVAULT_INERT) compiles out its only caller.
+__attribute__((unused))
 static void IVBootstrapRun(void) {
     // 1. Capture the REAL sandbox home before any redirect touches env vars.
     [IVPaths captureRealHome];
