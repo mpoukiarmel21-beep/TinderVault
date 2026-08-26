@@ -20,20 +20,26 @@ Ne bat PAS un échec de signature AMFI/kernel (avant notre code) ni un hash
 prouve), donc le self-check userspace est le vrai différenciateur.
 
 ## En cours
-Rien. `IVAntiTamper` implémenté, câblé, compilé et injecté : **build-6 vert**
-(dylib substrate-free, baseline 64K staged, load command injecté, IPA 241M).
-IPA prête : https://github.com/mpoukiarmel21-beep/TinderVault/releases/download/build-6/TinderVault.ipa
+Claude (Opus 4.8) — **bisection INERT**. build-6 (anti-tamper complet) **crashe
+toujours** au device → l'hypothèse « self-check d'intégrité » est infirmée ou
+insuffisante. On arrête de deviner. Build **INERT** produit = **build-8**
+(dylib injecté + re-signé À L'IDENTIQUE de build-6, mais les DEUX constructeurs
+sont des no-op : zéro hook, zéro anti-tamper, zéro isolation).
+IPA inert : https://github.com/mpoukiarmel21-beep/TinderVault/releases/download/build-8/TinderVault.ipa
+En attente du verdict device (crash / pas crash).
 
 ## Prochaine étape
-1. **Installer build-6 via Sideloadly** et lancer Tinder. Attendu : l'app se
-   lance (le self-check d'intégrité voit le header vierge). Log console si branché :
-   `[IVAntiTamper] armed: rc=0 ... redirect=on`.
-2. Si ça se lance → succès ; documenter le workflow de mise à jour récurrent.
-   Si ça crashe encore → la cause n'est pas (ou pas seulement) le self-check
-   par read/pread. Pistes suivantes : check via `mmap` (non intercepté), hash
-   `__TEXT` en mémoire, `.appex` imbriqué à re-signer, ou entitlement App-Group.
-   Trancher avec un build INERT (`-f inert=true`) : se lance = notre code ;
-   crashe = injection/re-signature/entitlement.
+Interpréter le test de build-8 (même modif binaire que build-6, notre code
+désactivé) :
+1. **build-8 crashe aussi** → le crash vient de la MODIF/re-signature/entitlement
+   elle-même, PAS de notre code. La redirection de self-read ne pouvait pas
+   aider. Pivot : tester l'IPA brute non modifiée (`v1.0-ipa`) pour isoler
+   entitlement/App-Group vs. simple présence d'un dylib injecté. Puis attaquer
+   côté pipeline : entitlements (App Attest/DeviceCheck, App-Groups),
+   re-signature profonde des `.framework`/`PlugIns/*.appex`, mmap-based integrity.
+2. **build-8 se lance** → le crash vient de NOTRE code actif (un hook/ctor).
+   Bisection par module : réactiver un cran à la fois (anti-tamper seul, puis
+   spoof, puis isolation, puis UI) jusqu'à retrouver le coupable.
 
 ## Blocages / risques
 - **IPA copyright** : le repo est **public** (nécessaire pour les runners macOS
@@ -49,6 +55,18 @@ IPA prête : https://github.com/mpoukiarmel21-beep/TinderVault/releases/download
   paiement/plafond GitHub n'est pas réglé. Rester en public pour le CI gratuit.
 
 ## Journal
+### 2026-08-26 (5) — Claude (Opus 4.8)
+build-6 (anti-tamper complet) **crashe toujours** au lancement (retour user :
+« tjrs crash »). Deux fixes hypothétiques d'affilée sans diagnostic → arrêt du
+tâtonnement, passage à la **bisection empirique**. Le build INERT (`-f inert=true`)
+échouait à compiler : `IVBootstrapRun` devenait `unused` sous `TINDERVAULT_INERT`
+(le `#else` qui l'appelle est retiré) → `-Werror,-Wunused-function`. Fix :
+`__attribute__((unused))` sur `IVBootstrapRun` (commit 526cf93). **build-8**
+(INERT) vert et publié. Vérifié qu'il n'existe que 2 constructeurs (Bootstrap +
+IVAntiTamper), tous deux no-op sous INERT, et aucun `+load` parasite → le build
+INERT est un vrai témoin neutre. Verdict device attendu pour trancher
+notre-code vs. modif/signature/entitlement.
+
 ### 2026-08-26 (4) — Claude (Opus 4.8)
 Correction autonome du crash au lancement (directive « fais-le toi-même »).
 Un agent de recherche a croisé la cause n°1 : **auto-vérification d'intégrité
