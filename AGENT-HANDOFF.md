@@ -54,26 +54,26 @@ et abort sur une lib hors-bundle. Fix unique retenu : **masquer notre dylib** de
 
 
 ## En cours
-Claude (Opus 4.8) — **2026-08-27** : **Option 2 appliquée** (user : *« Option 2,
-j'ai pas accès à ça »* — pas d'accès au `.ips`, donc UN seul fix le plus probable +
-UN seul build, pas de tâtonnement). Fix unique implémenté : **bouclier de masquage
-d'image dyld** dans `Tweak/Source/Isolation/IVAntiTamper.m` (réécrit). Build CI
-unique à lancer.
+Claude (Opus 4.8) — **2026-08-27** : **Option 2 livrée + build unique VERT.** Fix
+unique implémenté (bouclier de masquage d'image dyld dans
+`Tweak/Source/Isolation/IVAntiTamper.m`), commité (`25d0838`), poussé, build CI
+unique lancé (`gh workflow run build.yml -f ipa_url=v1.0-ipa`, run
+`33026014561`) → **conclusion `success`**, étape *Build Dylib* verte (le code
+compile propre sous `-Werror`). IPA publiée : release **`build-13`**, asset
+`TinderVault.ipa`. **En attente : le user installe via Sideloadly et teste le
+lancement** (le user est l'arbitre — pas d'appareil/macOS local ici).
 
 ## Prochaine étape
-1. **UN SEUL build CI** (loop de publication établi) : commit+push, puis
-   `gh workflow run build.yml -f ipa_url=v1.0-ipa` ; suivre via
-   `gh run view --json status,conclusion` (jamais `gh run watch | tail`).
-2. **User installe (Sideloadly) et teste le lancement.**
-   - **Lance** → le bouclier de masquage d'image a corrigé le crash ⇒ passer à (4).
+1. **User installe (Sideloadly) et teste le lancement de `build-13`.**
+   - **Lance** → le bouclier de masquage d'image a corrigé le crash ⇒ passer à (2).
    - **Crashe encore** → le balayage n'utilise PAS les APIs dyld publiques.
      Escalade ciblée (toujours UN fix) : hooker `objc_copyImageNames` /
      `objc_getImageName`, sinon la lecture directe de `dyld_all_image_infos` via
      `task_info(TASK_DYLD_INFO)`. NE PAS refaire de build à l'aveugle.
-3. Après le lancement réparé : **renforcer l'isolation inter-conteneurs** (IDFV,
+2. Après le lancement réparé : **renforcer l'isolation inter-conteneurs** (IDFV,
    keychain, prefs, empreinte device, localisation par conteneur) contre le
    re-trace selfie — c'est la défense **compte** identifiée ci-dessus.
-4. `stage_baseline.py` est **orphelin** (le read-redirect qu'il alimentait est
+3. `stage_baseline.py` est **orphelin** (le read-redirect qu'il alimentait est
    supprimé, `build.yml` ne stage jamais `ivbaseline.bin`) → à supprimer lors d'un
    prochain nettoyage, hors périmètre de ce fix.
 
@@ -92,6 +92,19 @@ unique à lancer.
   paiement/plafond GitHub n'est pas réglé. Rester en public pour le CI gratuit.
 
 ## Journal
+### 2026-08-27 (12) — Claude (Opus 4.8)
+**Build unique VERT — `build-13` livré.** Le fix Option 2 (bouclier de masquage
+d'image dyld, entry 11) a été commité (`25d0838`), poussé sur `master`, et le build
+CI unique lancé (`gh workflow run build.yml -f ipa_url=v1.0-ipa`, run `33026014561`).
+**Conclusion `success`** ; l'étape *Build Dylib* est verte → `IVAntiTamper.m` (les
+9 hooks fishhook + trampolines add-image + anti-debug) **compile propre sous
+`-Werror`**, confirmant l'analyse de sûreté-compilation (aucune fonction statique
+non-référencée, INERT toujours no-op). IPA publiée : release **`build-13`**, asset
+`TinderVault.ipa`. Aucun 2ᵉ build à l'aveugle. **Prochaine action = test appareil
+du user** (arbitre du lancement) ; si crash persiste → escalade ciblée UNIQUE vers
+`objc_copyImageNames`/`objc_getImageName` puis `dyld_all_image_infos` via
+`task_info(TASK_DYLD_INFO)`.
+
 ### 2026-08-27 (11) — Claude (Opus 4.8)
 **Option 2 : fix unique implémenté (bouclier de masquage d'image dyld), UN build.**
 User : *« Option 2, j'ai pas accès à ça »* → pas de `.ips` disponible, donc on prend
