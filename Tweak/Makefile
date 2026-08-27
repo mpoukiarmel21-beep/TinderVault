@@ -18,6 +18,7 @@ TinderVault_FILES = \
 	Source/Isolation/IVHomeRedirect.m \
 	Source/Isolation/IVKeychainHook.m \
 	Source/Isolation/IVPrefsHook.m \
+	Source/Isolation/IVAntiTamper.m \
 	Source/Spoof/IVDeviceSpoof.m \
 	Source/Spoof/IVDeviceIdentity.m \
 	Source/Spoof/IVLocaleSpoof.m \

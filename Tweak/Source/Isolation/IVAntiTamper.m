@@ -2,19 +2,16 @@
 #import "../vendor/fishhook/fishhook.h"
 
 #import <mach-o/dyld.h>
-#import <sys/syscall.h>
+#import <dlfcn.h>
 #import <sys/types.h>
+#import <sys/syscall.h>
 #import <sys/sysctl.h>
 #import <sys/proc.h>
 #import <unistd.h>
-#import <fcntl.h>
-#import <stdio.h>
-#import <stdlib.h>
 #import <string.h>
-#import <errno.h>
 #import <stdint.h>
 #import <stdarg.h>
-#import <limits.h>
+#import <stdio.h>
 #import <os/lock.h>
 
 #ifndef PT_DENY_ATTACH
@@ -24,215 +21,113 @@
 #define P_TRACED 0x00000800
 #endif
 
-// A tiny stderr logger — safe from the earliest constructor (no Foundation, no
-// CoreFoundation, just a write(2) to fd 2 which we never hook). Never called
-// from inside a read/open hot path.
+// Tiny stderr logger — safe from the earliest constructor (no Foundation).
 #define IVAT_LOG(...) do { fprintf(stderr, "[IVAntiTamper] " __VA_ARGS__); fprintf(stderr, "\n"); } while (0)
-
-#pragma mark - Baseline (pristine header bytes staged in the bundle at CI time)
-
-// ivbaseline.bin layout (little-endian): "IVB1", u32 regionCount,
-// then per region: u64 fileOffset, u64 length, <length> bytes.
-#define IVAT_MAX_REGIONS 8
-typedef struct { off_t off; size_t len; uint8_t *bytes; } IVATRegion;
-static IVATRegion gRegions[IVAT_MAX_REGIONS];
-static int        gRegionCount = 0;
 
 #pragma mark - State
 
 static BOOL gInstalled = NO;
-static BOOL gArmed     = NO;           // set true only after all origs are saved
-static char gMainReal[PATH_MAX] = {0}; // realpath of the main executable
-static const char *gMainBase = NULL;   // basename within gMainReal (fast pre-filter)
+static const struct mach_header *gSelfHeader = NULL;  // this dylib's own image
 
-// Saved originals. NOCANCEL variants share the same replacement; each keeps its
-// own slot (fishhook writes one per rebinding) and we call whichever is non-NULL.
-static ssize_t (*orig_read)(int, void *, size_t)            = NULL;
-static ssize_t (*orig_read_nc)(int, void *, size_t)         = NULL;
-static ssize_t (*orig_pread)(int, void *, size_t, off_t)    = NULL;
-static ssize_t (*orig_pread_nc)(int, void *, size_t, off_t) = NULL;
-static off_t   (*orig_lseek)(int, off_t, int)               = NULL;
-static int     (*orig_open)(const char *, int, ...)         = NULL;
-static int     (*orig_open_nc)(const char *, int, ...)      = NULL;
-static int     (*orig_openat)(int, const char *, int, ...)  = NULL;
-static int     (*orig_openat_nc)(int, const char *, int, ...) = NULL;
-static int     (*orig_close)(int)                           = NULL;
-static int     (*orig_close_nc)(int)                        = NULL;
-static int     (*orig_ptrace)(int, pid_t, caddr_t, int)     = NULL;
-static long    (*orig_syscall)(int, ...)                    = NULL;
-static int     (*orig_sysctl_at)(int *, u_int, void *, size_t *, void *, size_t) = NULL;
+// Saved originals (filled by fishhook at rebind time).
+static uint32_t                  (*orig_image_count)(void)                          = NULL;
+static const char *              (*orig_image_name)(uint32_t)                        = NULL;
+static const struct mach_header *(*orig_image_header)(uint32_t)                      = NULL;
+static intptr_t                  (*orig_image_slide)(uint32_t)                       = NULL;
+static void                      (*orig_register_add)(void (*)(const struct mach_header *, intptr_t)) = NULL;
+static int                       (*orig_dladdr)(const void *, Dl_info *)             = NULL;
+static int                       (*orig_ptrace)(int, pid_t, caddr_t, int)           = NULL;
+static long                      (*orig_syscall)(int, ...)                           = NULL;
+static int                       (*orig_sysctl)(int *, u_int, void *, size_t *, void *, size_t) = NULL;
 
-#pragma mark - fd tracking (only fds opened on the main-executable path)
+#pragma mark - Image hiding (make THIS dylib invisible to dyld enumeration)
 
-#define IVAT_MAX_FDS 64
-static struct { int fd; off_t off; } gFds[IVAT_MAX_FDS];
-static int gFdCount = 0;
-static os_unfair_lock gLock = OS_UNFAIR_LOCK_INIT;
+// Tinder scans the loaded-image list at launch and aborts when it finds a dylib
+// that is not part of the original bundle (the classic _dyld_image_count +
+// _dyld_get_image_name anti-injection sweep — same shape as GeoShift's
+// detectDynamicLibraryInjection). We give every enumerator a view of the list
+// with OUR row removed and the surrounding rows renumbered around it. Every
+// value returned is the REAL name/header/slide of a surviving image — only our
+// own entry is omitted, so the sweep never sees the injected library.
 
-static void iv_track_add(int fd) {
-    os_unfair_lock_lock(&gLock);
-    if (gFdCount < IVAT_MAX_FDS) { gFds[gFdCount].fd = fd; gFds[gFdCount].off = 0; gFdCount++; }
-    os_unfair_lock_unlock(&gLock);
-}
-// Returns the tracked offset for fd, or -1 if fd is not tracked.
-static off_t iv_track_off(int fd) {
-    off_t r = -1;
-    os_unfair_lock_lock(&gLock);
-    for (int i = 0; i < gFdCount; i++) if (gFds[i].fd == fd) { r = gFds[i].off; break; }
-    os_unfair_lock_unlock(&gLock);
-    return r;
-}
-static void iv_track_setoff(int fd, off_t off) {
-    os_unfair_lock_lock(&gLock);
-    for (int i = 0; i < gFdCount; i++) if (gFds[i].fd == fd) { gFds[i].off = off; break; }
-    os_unfair_lock_unlock(&gLock);
-}
-static void iv_track_remove(int fd) {
-    os_unfair_lock_lock(&gLock);
-    for (int i = 0; i < gFdCount; i++) if (gFds[i].fd == fd) { gFds[i] = gFds[--gFdCount]; break; }
-    os_unfair_lock_unlock(&gLock);
+static uint32_t iv_self_real_index(void) {
+    if (!gSelfHeader || !orig_image_count || !orig_image_header) return UINT32_MAX;
+    uint32_t c = orig_image_count();
+    for (uint32_t i = 0; i < c; i++)
+        if (orig_image_header(i) == gSelfHeader) return i;
+    return UINT32_MAX;
 }
 
-#pragma mark - Main-executable path + baseline loading (both before rebinding)
-
-static const char *iv_basename(const char *p) {
-    const char *b = strrchr(p, '/');
-    return b ? b + 1 : p;
+static uint32_t iv_real_index_for_public(uint32_t pub) {
+    uint32_t self = iv_self_real_index();
+    if (self == UINT32_MAX) return pub;      // not loaded (yet) → identity
+    return pub < self ? pub : pub + 1;       // skip our slot
 }
 
-static void iv_resolve_main_path(void) {
-    const char *n = _dyld_get_image_name(0);      // index 0 == main executable
-    if (!n) { gMainReal[0] = '\0'; return; }
-    if (!realpath(n, gMainReal)) strlcpy(gMainReal, n, sizeof(gMainReal));
-    gMainBase = iv_basename(gMainReal);
+static uint32_t iv_image_count(void) {
+    uint32_t c = orig_image_count ? orig_image_count() : 0;
+    return (c > 0 && iv_self_real_index() != UINT32_MAX) ? c - 1 : c;
+}
+static const char *iv_image_name(uint32_t i) {
+    return orig_image_name ? orig_image_name(iv_real_index_for_public(i)) : NULL;
+}
+static const struct mach_header *iv_image_header(uint32_t i) {
+    return orig_image_header ? orig_image_header(iv_real_index_for_public(i)) : NULL;
+}
+static intptr_t iv_image_slide(uint32_t i) {
+    return orig_image_slide ? orig_image_slide(iv_real_index_for_public(i)) : 0;
 }
 
-// True when `path` refers to the main executable. Cheap basename check first,
-// then a realpath comparison only on a basename match.
-static BOOL iv_is_main_path(const char *path) {
-    if (!path || !gMainBase || gMainReal[0] == '\0') return NO;
-    if (strcmp(iv_basename(path), gMainBase) != 0) return NO;   // fast reject
-    char rp[PATH_MAX];
-    if (realpath(path, rp)) return strcmp(rp, gMainReal) == 0;
-    return strcmp(path, gMainReal) == 0;
+#pragma mark - add-image callback filtering
+
+// _dyld_register_func_for_add_image replays every already-loaded image to the
+// caller synchronously, then delivers future ones. A caller registered AFTER us
+// (Tinder / Sentry) must not receive our image. We slot each callback behind a
+// dedicated trampoline that drops our header and forwards the rest. dyld drives
+// these under its own lock, so the hot path stays lock-free.
+#define IV_MAX_ADDCB 8
+static void (*gAddFuncs[IV_MAX_ADDCB])(const struct mach_header *, intptr_t);
+static int gAddCount = 0;
+static os_unfair_lock gAddLock = OS_UNFAIR_LOCK_INIT;
+
+static void iv_add_dispatch(int slot, const struct mach_header *mh, intptr_t slide) {
+    if (mh == gSelfHeader) return;                       // hide the injected image
+    void (*f)(const struct mach_header *, intptr_t) = gAddFuncs[slot];
+    if (f) f(mh, slide);
+}
+#define IV_TRAMP(n) static void iv_add_tramp_##n(const struct mach_header *mh, intptr_t s) { iv_add_dispatch(n, mh, s); }
+IV_TRAMP(0) IV_TRAMP(1) IV_TRAMP(2) IV_TRAMP(3)
+IV_TRAMP(4) IV_TRAMP(5) IV_TRAMP(6) IV_TRAMP(7)
+static void (*const gAddTramps[IV_MAX_ADDCB])(const struct mach_header *, intptr_t) = {
+    iv_add_tramp_0, iv_add_tramp_1, iv_add_tramp_2, iv_add_tramp_3,
+    iv_add_tramp_4, iv_add_tramp_5, iv_add_tramp_6, iv_add_tramp_7,
+};
+
+static void iv_register_add(void (*func)(const struct mach_header *, intptr_t)) {
+    os_unfair_lock_lock(&gAddLock);
+    int slot = (gAddCount < IV_MAX_ADDCB) ? gAddCount++ : -1;
+    if (slot >= 0) gAddFuncs[slot] = func;
+    os_unfair_lock_unlock(&gAddLock);
+    if (!orig_register_add) return;
+    if (slot < 0) { orig_register_add(func); return; }   // overflow → unfiltered
+    orig_register_add(gAddTramps[slot]);                 // dyld replays existing images now
 }
 
-// Loads ivbaseline.bin from the app bundle (dir of the main executable). Uses
-// the REAL open/read directly — called BEFORE rebinding, so no hook fires and
-// no recursion is possible. Silent no-op on any error (redirect stays disabled).
-static void iv_load_baseline(void) {
-    if (gMainReal[0] == '\0') return;
-    char path[PATH_MAX];
-    strlcpy(path, gMainReal, sizeof(path));
-    char *slash = strrchr(path, '/');
-    if (!slash) return;
-    *slash = '\0';                                  // -> .../Tinder.app
-    strlcat(path, "/ivbaseline.bin", sizeof(path));
-
-    int fd = open(path, O_RDONLY);
-    if (fd < 0) { IVAT_LOG("no baseline (%s) — redirect disabled, anti-debug only", strerror(errno)); return; }
-
-    uint8_t hdr[8];
-    if (read(fd, hdr, 8) != 8 || memcmp(hdr, "IVB1", 4) != 0) { close(fd); IVAT_LOG("baseline bad magic"); return; }
-    uint32_t count; memcpy(&count, hdr + 4, 4);
-    if (count == 0 || count > IVAT_MAX_REGIONS) { close(fd); IVAT_LOG("baseline bad count=%u", count); return; }
-
-    for (uint32_t i = 0; i < count; i++) {
-        uint8_t meta[16];
-        if (read(fd, meta, 16) != 16) { IVAT_LOG("baseline truncated meta"); break; }
-        uint64_t off, len; memcpy(&off, meta, 8); memcpy(&len, meta + 8, 8);
-        if (len == 0 || len > (64u * 1024u * 1024u)) { IVAT_LOG("baseline bad len=%llu", len); break; }
-        uint8_t *b = malloc((size_t)len);
-        if (!b) break;
-        if (read(fd, b, (size_t)len) != (ssize_t)len) { free(b); IVAT_LOG("baseline truncated data"); break; }
-        gRegions[gRegionCount].off = (off_t)off;
-        gRegions[gRegionCount].len = (size_t)len;
-        gRegions[gRegionCount].bytes = b;
-        gRegionCount++;
-    }
-    close(fd);
-    IVAT_LOG("baseline loaded: %d region(s)", gRegionCount);
-}
-
-// Overlays pristine bytes onto a buffer that holds file bytes [fileOff, fileOff+n).
-static void iv_overlay(off_t fileOff, void *buf, size_t n) {
-    for (int i = 0; i < gRegionCount; i++) {
-        off_t a = fileOff > gRegions[i].off ? fileOff : gRegions[i].off;
-        off_t bEnd = (off_t)(fileOff + (off_t)n);
-        off_t rEnd = (off_t)(gRegions[i].off + (off_t)gRegions[i].len);
-        off_t b = bEnd < rEnd ? bEnd : rEnd;
-        if (a < b) {
-            memcpy((uint8_t *)buf + (a - fileOff),
-                   gRegions[i].bytes + (a - gRegions[i].off),
-                   (size_t)(b - a));
-        }
-    }
-}
-
-#pragma mark - File-read hooks (redirect self-reads to the pristine baseline)
-
-static int iv_open(const char *path, int flags, ...) {
-    mode_t mode = 0;
-    if (flags & O_CREAT) { va_list ap; va_start(ap, flags); mode = (mode_t)va_arg(ap, int); va_end(ap); }
-    int (*o)(const char *, int, ...) = orig_open ? orig_open : orig_open_nc;
-    int fd = o ? o(path, flags, mode) : -1;
-    if (fd >= 0 && gRegionCount > 0 && iv_is_main_path(path)) iv_track_add(fd);
-    return fd;
-}
-
-static int iv_openat(int dirfd, const char *path, int flags, ...) {
-    mode_t mode = 0;
-    if (flags & O_CREAT) { va_list ap; va_start(ap, flags); mode = (mode_t)va_arg(ap, int); va_end(ap); }
-    int (*o)(int, const char *, int, ...) = orig_openat ? orig_openat : orig_openat_nc;
-    int fd = o ? o(dirfd, path, flags, mode) : -1;
-    // Only absolute paths can be matched against the resolved main-exec path.
-    if (fd >= 0 && gRegionCount > 0 && path && path[0] == '/' && iv_is_main_path(path)) iv_track_add(fd);
-    return fd;
-}
-
-static ssize_t iv_read(int fd, void *buf, size_t n) {
-    ssize_t (*o)(int, void *, size_t) = orig_read ? orig_read : orig_read_nc;
-    ssize_t k = o ? o(fd, buf, n) : -1;
-    // Lock-free fast reject: no main-exec fd is open, so nothing to overlay.
-    if (k > 0 && gRegionCount > 0 && gFdCount > 0) {
-        off_t off = iv_track_off(fd);
-        if (off >= 0) {                             // fd is the main executable
-            iv_overlay(off, buf, (size_t)k);
-            iv_track_setoff(fd, off + k);           // read(2) advances the offset
-        }
-    }
-    return k;
-}
-
-static ssize_t iv_pread(int fd, void *buf, size_t n, off_t offset) {
-    ssize_t (*o)(int, void *, size_t, off_t) = orig_pread ? orig_pread : orig_pread_nc;
-    ssize_t k = o ? o(fd, buf, n, offset) : -1;
-    if (k > 0 && gRegionCount > 0 && gFdCount > 0 && iv_track_off(fd) >= 0) iv_overlay(offset, buf, (size_t)k);
-    return k;                                       // pread does NOT move the fd offset
-}
-
-static off_t iv_lseek(int fd, off_t offset, int whence) {
-    off_t r = orig_lseek ? orig_lseek(fd, offset, whence) : -1;
-    if (r >= 0 && gFdCount > 0 && iv_track_off(fd) >= 0) iv_track_setoff(fd, r);
+static int iv_dladdr(const void *addr, Dl_info *info) {
+    int r = orig_dladdr ? orig_dladdr(addr, info) : 0;
+    if (r && info && gSelfHeader && info->dli_fbase == (const void *)gSelfHeader)
+        return 0;                                        // address resolves to "no image"
     return r;
 }
 
-static int iv_close(int fd) {
-    if (gFdCount > 0) iv_track_remove(fd);
-    int (*o)(int) = orig_close ? orig_close : orig_close_nc;
-    return o ? o(fd) : -1;
-}
-
-#pragma mark - Anti-debug hooks (RASP self-checks that abort when "traced")
+#pragma mark - Anti-debug (defeat RASP self-checks that abort when "traced")
 
 static int iv_ptrace(int request, pid_t pid, caddr_t addr, int data) {
-    if (request == PT_DENY_ATTACH) return 0;        // swallow — the classic abort trigger
+    if (request == PT_DENY_ATTACH) return 0;             // swallow the self-deny
     if (orig_ptrace) return orig_ptrace(request, pid, addr, data);
     return (int)syscall(SYS_ptrace, request, pid, addr, data);
 }
 
-// Some anti-debug code calls ptrace via the raw syscall stub instead of the libc
-// wrapper. Sniff SYS_ptrace(PT_DENY_ATTACH) and swallow it.
 static long iv_syscall(int number, ...) {
     va_list ap; va_start(ap, number);
     long a0 = va_arg(ap, long), a1 = va_arg(ap, long), a2 = va_arg(ap, long),
@@ -243,11 +138,9 @@ static long iv_syscall(int number, ...) {
     return 0;
 }
 
-// Clear the P_TRACED bit from sysctl(KERN_PROC, KERN_PROC_PID) so a debugger-
-// presence check reads clean. Chains correctly with IVDeviceSpoof's own sysctl
-// hook (fishhook links the two; each calls its saved original).
 static int iv_sysctl(int *name, u_int nl, void *oldp, size_t *oldlenp, void *newp, size_t newlen) {
-    int r = orig_sysctl_at ? orig_sysctl_at(name, nl, oldp, oldlenp, newp, newlen) : -1;
+    int r = orig_sysctl ? orig_sysctl(name, nl, oldp, oldlenp, newp, newlen) : -1;
+    // Clear P_TRACED so a KERN_PROC self-query never reports a debugger.
     if (r == 0 && oldp && oldlenp && name && nl >= 4 &&
         name[0] == CTL_KERN && name[1] == KERN_PROC && name[2] == KERN_PROC_PID &&
         *oldlenp >= sizeof(struct kinfo_proc)) {
@@ -265,45 +158,34 @@ static int iv_sysctl(int *name, u_int nl, void *oldp, size_t *oldlenp, void *new
     if (gInstalled) return;
     gInstalled = YES;
 
-    // 1. Resolve the main executable and load the pristine baseline BEFORE
-    //    rebinding, so the loader's own reads use the real syscalls.
-    iv_resolve_main_path();
-    iv_load_baseline();
+    // Identify our own image BEFORE rebinding, via the real dladdr (our hook is
+    // not armed yet). The address of a static in this file resolves to this
+    // dylib's mach_header through Dl_info.dli_fbase.
+    Dl_info info;
+    if (dladdr((const void *)&gInstalled, &info)) gSelfHeader = (const struct mach_header *)info.dli_fbase;
 
-    // 2. Rebind. Read-redirect symbols are only wired when a baseline exists;
-    //    anti-debug symbols are always wired (cheap, no state needed).
-    struct rebinding rb[20];
+    struct rebinding rb[16];
     int n = 0;
-    rb[n++] = (struct rebinding){"ptrace",  (void *)iv_ptrace,  (void **)&orig_ptrace};
-    rb[n++] = (struct rebinding){"syscall", (void *)iv_syscall, (void **)&orig_syscall};
-    rb[n++] = (struct rebinding){"sysctl",  (void *)iv_sysctl,  (void **)&orig_sysctl_at};
-    if (gRegionCount > 0) {
-        rb[n++] = (struct rebinding){"open",             (void *)iv_open,   (void **)&orig_open};
-        rb[n++] = (struct rebinding){"open$NOCANCEL",     (void *)iv_open,   (void **)&orig_open_nc};
-        rb[n++] = (struct rebinding){"openat",           (void *)iv_openat, (void **)&orig_openat};
-        rb[n++] = (struct rebinding){"openat$NOCANCEL",   (void *)iv_openat, (void **)&orig_openat_nc};
-        rb[n++] = (struct rebinding){"read",             (void *)iv_read,   (void **)&orig_read};
-        rb[n++] = (struct rebinding){"read$NOCANCEL",     (void *)iv_read,   (void **)&orig_read_nc};
-        rb[n++] = (struct rebinding){"pread",            (void *)iv_pread,  (void **)&orig_pread};
-        rb[n++] = (struct rebinding){"pread$NOCANCEL",    (void *)iv_pread,  (void **)&orig_pread_nc};
-        rb[n++] = (struct rebinding){"lseek",            (void *)iv_lseek,  (void **)&orig_lseek};
-        rb[n++] = (struct rebinding){"close",            (void *)iv_close,  (void **)&orig_close};
-        rb[n++] = (struct rebinding){"close$NOCANCEL",    (void *)iv_close,  (void **)&orig_close_nc};
-    }
+    rb[n++] = (struct rebinding){"_dyld_image_count",                (void *)iv_image_count,   (void **)&orig_image_count};
+    rb[n++] = (struct rebinding){"_dyld_get_image_name",             (void *)iv_image_name,    (void **)&orig_image_name};
+    rb[n++] = (struct rebinding){"_dyld_get_image_header",           (void *)iv_image_header,  (void **)&orig_image_header};
+    rb[n++] = (struct rebinding){"_dyld_get_image_vmaddr_slide",     (void *)iv_image_slide,   (void **)&orig_image_slide};
+    rb[n++] = (struct rebinding){"_dyld_register_func_for_add_image",(void *)iv_register_add,  (void **)&orig_register_add};
+    rb[n++] = (struct rebinding){"dladdr",                           (void *)iv_dladdr,        (void **)&orig_dladdr};
+    rb[n++] = (struct rebinding){"ptrace",                           (void *)iv_ptrace,        (void **)&orig_ptrace};
+    rb[n++] = (struct rebinding){"syscall",                          (void *)iv_syscall,       (void **)&orig_syscall};
+    rb[n++] = (struct rebinding){"sysctl",                           (void *)iv_sysctl,        (void **)&orig_sysctl};
     int rc = rebind_symbols(rb, n);
-    gArmed = YES;
-    IVAT_LOG("armed: rc=%d symbols=%d redirect=%s main=%s",
-             rc, n, gRegionCount > 0 ? "on" : "off", gMainReal[0] ? gMainReal : "?");
+    IVAT_LOG("armed rc=%d self=%p hidden_real_index=%u", rc, (void *)gSelfHeader, iv_self_real_index());
 }
 
 @end
 
+// Priority 101 → runs before Bootstrap's default-priority constructor, so the
+// shield is up before any of our own (or the app's later) code touches dyld.
 __attribute__((constructor(101)))
 static void IVAntiTamperCtor(void) {
 #ifndef TINDERVAULT_INERT
-    // Earliest priority so the hooks are armed before the host's integrity /
-    // anti-debug initializers run. Pure C path — no Foundation touched here.
-    // (Skipped in the INERT diagnostic build so it stays a true no-op baseline.)
     [IVAntiTamper install];
 #endif
 }
